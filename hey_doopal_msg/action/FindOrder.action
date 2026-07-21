@@ -1,0 +1,6 @@
+string target
+---
+bool is_found
+---
+TargetPoint[] coordinates
+
