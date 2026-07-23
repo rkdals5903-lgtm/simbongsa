@@ -8,6 +8,8 @@ find_package(rosidl_default_generators REQUIRED)
 # 서비스 인터페이스 생성
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/VoiceKeyword.srv"
+  "srv/ScanRequest.srv"
+  "srv/GripBoundingBox.srv"
 
   "action/FindOrder.action"
 )
