@@ -59,7 +59,7 @@ class ObjectDetectionNode(Node):
         depth_topic='/camera/camera/aligned_depth_to_color/image_raw',
         camera_info_topic='/camera/camera/color/camera_info',
         db_api_url='http://172.18.0.198:5000/api/objects/',  # DB API 엔드포인트로 수정
-        hand_eye_transform_path='/home/rokey/ros2_ws/src/simbongsa/desk_detect/desk_detect/T_gripper2camera.npy',  # 실제 경로
+        hand_eye_transform_path='/home/rokey/cobot_ws/src/simbongsa/desk_detect/desk_detect/T_gripper2camera.npy',  # 실제 경로
         base_frame='base_link',          # 로봇제어 실제 이름 확인 필요
         calibration_frame='link_6',      # 실제 TF 이름 확인 필요
         full_scan_conf=0.6,
@@ -68,6 +68,7 @@ class ObjectDetectionNode(Node):
         find_target_interval=0.15,       # 재시도 간격(초)
         grip_retry_attempts=3,           # grip_bounding_box: 순간 인식실패 대비 짧은 재시도 횟수
         grip_retry_interval=0.15,        # grip_bounding_box: 재시도 간격(초)
+        per_class_conf_threshold=None,   # 예: {'airpods': 0.9} -> airpods만 0.9, 나머진 기존 threshold 그대로
     ):
         super().__init__('object_detection_node')
         self.model = model
@@ -80,6 +81,7 @@ class ObjectDetectionNode(Node):
         self.find_target_interval = find_target_interval
         self.grip_retry_attempts = grip_retry_attempts
         self.grip_retry_interval = grip_retry_interval
+        self.per_class_conf_threshold = per_class_conf_threshold or {}
 
         # ---------- TF2 + 팀 공용 좌표 변환기 ----------
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10.0))
@@ -179,6 +181,12 @@ class ObjectDetectionNode(Node):
 
                 cls = int(box.cls[0])
                 label = self.classNames.get(cls, f'class_{cls}')
+                # 클래스별로 threshold를 다르게 주고 싶으면 여기서 오버라이드
+                # (없으면 기존처럼 conf_threshold 그대로 사용)
+                effective_threshold = self.per_class_conf_threshold.get(label, conf_threshold)
+                if confidence < effective_threshold:
+                    continue
+
                 if target_label and label != target_label:
                     continue
 
@@ -390,7 +398,7 @@ class ObjectDetectionNode(Node):
 
 
 def main():
-    model_path = '/home/rokey/ros2_ws/src/simbongsa/desk_detect/my_best_roboflow.pt'  # 학습된 모델 경로로 수정
+    model_path = '/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_best_roboflow.pt'  # 학습된 모델 경로로 수정
 
     if not Path(model_path).exists():
         print(f'File not found: {model_path}')
@@ -406,7 +414,10 @@ def main():
         sys.exit(1)
 
     rclpy.init()
-    node = ObjectDetectionNode(model)
+    node = ObjectDetectionNode(
+        model,
+        per_class_conf_threshold={'airpods': 0.9},
+    )
 
     # 서비스/액션 콜백이 서로, 그리고 frame_callback과 동시에 돌아야 하므로 MultiThreadedExecutor 필수
     executor = MultiThreadedExecutor()
