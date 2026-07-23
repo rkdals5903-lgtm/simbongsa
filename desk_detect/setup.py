@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'object_detect = desk_detect.object_detection_node:main',
         ],
     },
 )

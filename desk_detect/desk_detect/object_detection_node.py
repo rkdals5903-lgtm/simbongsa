@@ -5,11 +5,14 @@
 
   - ScanRequest 서비스 ('yolo_scan_request')
       -> 책상 전체 스캔. 로봇제어가 웨이포인트마다 도착할 때 1번씩 호출.
-        1프레임 인식 + DB upsert 후 바로 응답.
+         1프레임 인식 + DB upsert 후 바로 응답.
 
   - FindOrder 액션 ('find_order')
       -> 에어팟 등 특정 물체 찾기. goal(target_name) 받으면 계속 최신 프레임 확인,
-        state로 진행상황 feedback, 찾으면 result(found, coordinate, message) 반환.
+         state로 진행상황 feedback, 찾으면 result(found, coordinate, message) 반환.
+
+좌표 변환은 팀 공용 모듈 rgbd_pixel_to_base.py의 RgbdPixelToBase를 사용함.
+(Hand-Eye 캘리브레이션 행렬 + TF(base_link<->link_6)로 로봇 베이스 좌표계 계산)
 """
 
 import math
@@ -17,7 +20,6 @@ import sys
 import time
 import threading
 import requests
-import numpy as np
 from pathlib import Path
 from ultralytics import YOLO
 
@@ -26,13 +28,20 @@ from rclpy.node import Node
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.duration import Duration
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo
 import message_filters
 
-#  TODO 실제 인터페이스 패키지명에 맞게 수정
-from hey_doopal_msg.srv import ScanRequest   # ← 서비스 타입 (신규)
-from hey_doopal_msg.action import FindOrder  # ← 액션 타입 (기존)
+import tf2_ros
+
+# 같은 패키지 안에 넣어둔 팀 공용 좌표변환 모듈
+# (패키지 구조에 맞게 상대/절대 import 조정 필요)
+from .rgbd_pixel_to_base import RgbdPixelToBase, bbox_center_xyxy
+
+# TODO 실제 인터페이스 패키지명 다시 한번 확인
+from hey_doopal_msg.srv import ScanRequest
+from hey_doopal_msg.action import FindOrder
 
 
 class ObjectDetectionNode(Node):
@@ -43,10 +52,13 @@ class ObjectDetectionNode(Node):
         depth_topic='/camera/camera/aligned_depth_to_color/image_raw',
         camera_info_topic='/camera/camera/color/camera_info',
         db_api_url='http://localhost:8000/api/objects/',  # Django DB API 엔드포인트로 수정
+        hand_eye_transform_path='/home/rokey/ros2_ws/src/simbongsa/desk_detect/desk_detect/T_gripper2camera.npy',  # 실제 경로
+        base_frame='base_link',          # 로봇제어 실제 이름 확인 필요
+        calibration_frame='link_6',      # 실제 TF 이름 확인 필요
         full_scan_conf=0.6,
         find_target_conf=0.5,
-        find_target_timeout=10.0,   # 초. 이 시간 안에 못 찾으면 is_found=False
-        find_target_interval=0.15,  # 재시도 간격(초)
+        find_target_timeout=15.0,        # 초. 이 시간 안에 못 찾으면 is_found=False
+        find_target_interval=0.15,       # 재시도 간격(초)
     ):
         super().__init__('object_detection_node')
         self.model = model
@@ -58,13 +70,27 @@ class ObjectDetectionNode(Node):
         self.find_target_timeout = find_target_timeout
         self.find_target_interval = find_target_interval
 
+        # ---------- TF2 + 팀 공용 좌표 변환기 ----------
+        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.coordinate_transformer = RgbdPixelToBase(
+            tf_buffer=self.tf_buffer,
+            transform_path=hand_eye_transform_path,
+            base_frame=base_frame,
+            calibration_frame=calibration_frame,
+            transform_direction='gripper_to_camera',
+            transform_translation_unit='auto',
+        )
+
         # ---------- 카메라 관련 (공용) ----------
-        self.fx = self.fy = self.cx_intr = self.cy_intr = None
+        self.latest_camera_info = None
         self.create_subscription(
             CameraInfo, camera_info_topic, self.camera_info_callback, 10)
 
         self.latest_color = None
         self.latest_depth = None
+        self.latest_depth_encoding = None
         self.frame_lock = threading.Lock()
 
         color_sub = message_filters.Subscriber(self, Image, color_topic)
@@ -78,8 +104,6 @@ class ObjectDetectionNode(Node):
         self.scan_srv = self.create_service(
             ScanRequest, 'yolo_scan_request',
             self.handle_scan_request, callback_group=service_cb_group)
-        
-        # 스캔 요청 오면 실행 할 함수 handle_scan_request
 
         # ---------- 액션 서버: 타겟 찾기 ----------
         action_cb_group = ReentrantCallbackGroup()
@@ -98,38 +122,18 @@ class ObjectDetectionNode(Node):
 
     # ================= 카메라 수신 (공용) =================
     def camera_info_callback(self, msg: CameraInfo):
-        self.fx = msg.k[0]
-        self.fy = msg.k[4]
-        self.cx_intr = msg.k[2]
-        self.cy_intr = msg.k[5]
+        self.latest_camera_info = msg  # raw 메시지 그대로 저장 (변환기가 직접 씀)
 
     def frame_callback(self, color_msg: Image, depth_msg: Image):
         color_img = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
+        # depth는 encoding 그대로 유지해야 변환기가 mm/m 판단 가능 -> passthrough
         depth_img = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         with self.frame_lock:
             self.latest_color = color_img
             self.latest_depth = depth_img
+            self.latest_depth_encoding = depth_msg.encoding
 
-    # ================= 좌표 변환 유틸 (공용) =================
-    def pixel_to_3d(self, u, v, depth_m):
-        if depth_m <= 0.0 or self.fx is None:
-            return None
-        x = (u - self.cx_intr) * depth_m / self.fx
-        y = (v - self.cy_intr) * depth_m / self.fy
-        return float(x), float(y), float(depth_m)
-
-    def get_depth_at_bbox(self, depth_img, x1, y1, x2, y2):
-        h, w = depth_img.shape[:2]
-        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-        half = max(2, (x2 - x1) // 8)
-        xs = slice(max(0, cx - half), min(w, cx + half))
-        ys = slice(max(0, cy - half), min(h, cy + half))
-        patch = depth_img[ys, xs].astype(np.float32)
-        valid = patch[patch > 0]
-        if valid.size == 0:
-            return None, cx, cy
-        return float(np.median(valid)) / 1000.0, cx, cy
-
+    # ================= 인식 + 좌표 변환 (공용) =================
     def run_inference_on_latest_frame(self, conf_threshold, target_label=None):
         """target_label=None -> 전체 스캔, 지정하면 그 라벨만 필터링 (타겟 찾기)"""
         with self.frame_lock:
@@ -137,8 +141,10 @@ class ObjectDetectionNode(Node):
                 return []
             color_img = self.latest_color.copy()
             depth_img = self.latest_depth.copy()
+            depth_encoding = self.latest_depth_encoding
 
-        if self.fx is None:
+        camera_info = self.latest_camera_info
+        if camera_info is None:
             return []
 
         results = self.model(color_img, verbose=False)
@@ -152,26 +158,33 @@ class ObjectDetectionNode(Node):
 
                 cls = int(box.cls[0])
                 label = self.classNames.get(cls, f'class_{cls}')
-                # 내가 찾는 라벨이 아니면 continue 에서 거름 (라벨이 다르면 버린다.)
                 if target_label and label != target_label:
                     continue
 
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                depth_m, cx, cy = self.get_depth_at_bbox(depth_img, x1, y1, x2, y2)
-                if depth_m is None:
+                cu, cv = bbox_center_xyxy(x1, y1, x2, y2)
+
+                coord_result = self.coordinate_transformer.pixel_to_base(
+                    u=cu, v=cv,
+                    depth_image=depth_img,
+                    depth_encoding=depth_encoding,
+                    camera_info=camera_info,
+                )
+                if coord_result is None:
+                    # depth 유효값 부족 또는 TF(base_link<->calibration_frame) 조회 실패
                     continue
 
-                point_3d = self.pixel_to_3d(cx, cy, depth_m)
-                if point_3d is None:
-                    continue
+                bx, by, bz = coord_result.base_point_m
 
-                x, y, z = point_3d
                 detections.append({
                     'class_name': label,
                     'confidence': confidence,
-                    'x': round(x, 4),
-                    'y': round(y, 4),
-                    'z': round(z, 4),
+                    'x': round(float(bx), 4),          # 로봇 베이스 좌표계 (m)
+                    'y': round(float(by), 4),
+                    'z': round(float(bz), 4),
+                    'camera_depth_z': round(float(coord_result.depth_m), 4),  # 카메라 raw depth (m)
+                    'bbox_width': x2 - x1,
+                    'bbox_height': y2 - y1,
                 })
 
         return detections
@@ -203,18 +216,15 @@ class ObjectDetectionNode(Node):
         self.get_logger().info(f'[전체 스캔] 요청 수신 (waypoint_id="{request.waypoint_id}")')
 
         detections = self.run_inference_on_latest_frame(self.full_scan_conf)
-        # target_label 안넘김 — 즉 None(기본값)이라 전체 클래스 다 탐지하는 모드로 호출.
 
         if detections:
-            # detections 리스트에 뭐라도 들어있으면 (물체를 1개 이상 찾음)
             self.upsert_to_db(detections)
             response.success = True
             response.message = f'{len(detections)}개 객체 스캔 및 DB 저장 완료'
             response.detected_count = len(detections)
         else:
-            # detections가 빈 리스트([])면 (이번 프레임엔 아무것도 안 보임)
             response.success = True
-            response.message = '탐지된 객체 없음'
+            response.message = '탐지된 객체 없음 (또는 depth/TF 문제로 계산 실패)'
             response.detected_count = 0
 
         self.get_logger().info(f'[전체 스캔] 응답: {response.message}')
@@ -245,7 +255,10 @@ class ObjectDetectionNode(Node):
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
                 result.found = False
-                result.coordinate = [0.0] * 6
+                result.coordinate = [0.0] * 3
+                result.bbox_width = 0.0
+                result.bbox_height = 0.0
+                result.camera_depth_z = 0.0
                 result.message = ''
                 self.get_logger().info(f'[타겟 찾기] "{target_label}" 취소됨 ({attempts}번 시도)')
                 return result
@@ -254,9 +267,7 @@ class ObjectDetectionNode(Node):
             detections = self.run_inference_on_latest_frame(
                 self.find_target_conf, target_label=target_label)
 
-            feedback_msg.state = (
-                f'"{target_label}" 발견됨 (시도 {attempts}회)' if detections
-                else f'탐색 중... (시도 {attempts}회)')
+            feedback_msg.state = 'detected' if detections else 'searching'
             goal_handle.publish_feedback(feedback_msg)
 
             if detections:
@@ -266,19 +277,28 @@ class ObjectDetectionNode(Node):
             time.sleep(self.find_target_interval)
 
         if found_detection:
+            feedback_msg.state = 'calculating'
+            goal_handle.publish_feedback(feedback_msg)
+
+            # run_inference_on_latest_frame에서 이미 base 좌표까지 다 계산해서 넣어둠
             self.upsert_to_db([found_detection])
             goal_handle.succeed()
 
-            x, y, z = found_detection['x'], found_detection['y'], found_detection['z']
             result.found = True
-            # coordinate는 배열 길이 6 고정(인터페이스 스펙)이지만, 지금은 x,y,z 3개만 실제 값
-            result.coordinate = [x, y, z, 0.0, 0.0, 0.0]
+            result.coordinate = [
+                found_detection['x'], found_detection['y'], found_detection['z']]
+            result.bbox_width = float(found_detection['bbox_width'])
+            result.bbox_height = float(found_detection['bbox_height'])
+            result.camera_depth_z = float(found_detection['camera_depth_z'])
             result.message = found_detection['class_name']
             self.get_logger().info(f'[타겟 찾기] "{target_label}" {attempts}번 시도 만에 발견')
         else:
             goal_handle.abort()
             result.found = False
-            result.coordinate = [0.0] * 6
+            result.coordinate = [0.0] * 3
+            result.bbox_width = 0.0
+            result.bbox_height = 0.0
+            result.camera_depth_z = 0.0
             result.message = ''
             self.get_logger().warn(
                 f'[타겟 찾기] "{target_label}" {self.find_target_timeout}초 동안 못 찾음 '
