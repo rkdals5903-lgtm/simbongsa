@@ -26,7 +26,7 @@ RGB 토픽:
 ---------
 python3 realsense_yolo_best_test.py \
   --ros-args \
-  -p model_path:=/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_aug_best.pt \
+  -p model_path:=/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_best_roboflow.pt \
   -p confidence:=0.5
 """
 
@@ -72,7 +72,7 @@ class RealSenseYoloTester(Node):
         # ROS2 파라미터
         self.declare_parameter(
             "model_path",
-            "/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_aug_best.pt",
+            "/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_seg_best.pt",
         )
         self.declare_parameter(
             "color_topic",
@@ -220,6 +220,10 @@ class RealSenseYoloTester(Node):
         여기서 클래스별 threshold를 한 번 더 적용해서 통과하는 박스 인덱스만 골라냄.
         per_class_conf_threshold에 없는 클래스는 이미 predict 단계에서
         self.confidence로 걸러진 상태 그대로 통과.
+
+        세그멘테이션 모델(-seg)은 boxes와 masks가 1:1로 대응돼야 하므로,
+        boxes를 필터링하면 masks도 반드시 같은 인덱스로 같이 필터링해야 함
+        (안 그러면 plot() 단계에서 개수 불일치로 텐서 크기 에러 발생).
         """
         if not self.per_class_conf_threshold or result.boxes is None:
             return result
@@ -235,6 +239,8 @@ class RealSenseYoloTester(Node):
                 keep_indices.append(i)
 
         result.boxes = result.boxes[keep_indices]
+        if result.masks is not None:                      # ★ 신규: seg 모델 대응
+            result.masks = result.masks[keep_indices]
         return result
 
     def run_inference(

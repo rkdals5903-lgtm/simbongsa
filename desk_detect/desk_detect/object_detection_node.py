@@ -401,7 +401,7 @@ class ObjectDetectionNode(Node):
 
 
 def main():
-    model_path = '/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_aug_best.pt'  # 학습된 모델 경로로 수정
+    model_path = '/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_seg_best.pt'  # 학습된 모델 경로로 수정
 
     if not Path(model_path).exists():
         print(f'File not found: {model_path}')
