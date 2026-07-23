@@ -26,7 +26,7 @@ RGB 토픽:
 ---------
 python3 realsense_yolo_best_test.py \
   --ros-args \
-  -p model_path:=/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_best_roboflow.pt \
+  -p model_path:=/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_aug_best.pt \
   -p confidence:=0.5
 """
 
@@ -72,7 +72,7 @@ class RealSenseYoloTester(Node):
         # ROS2 파라미터
         self.declare_parameter(
             "model_path",
-            "/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_best_roboflow.pt",
+            "/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_aug_best.pt",
         )
         self.declare_parameter(
             "color_topic",

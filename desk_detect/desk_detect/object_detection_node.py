@@ -284,14 +284,17 @@ class ObjectDetectionNode(Node):
             response.bbox_width = float(best['bbox_width'])
             response.bbox_height = float(best['bbox_height'])
             response.camera_depth_z = float(best['camera_depth_z'])
+            response.is_find = True
             self.get_logger().info(f'[그립 확인] "{target_label}" 확인됨')
         else:
             # found 필드가 없는 인터페이스라 "전부 0"으로 없음을 표현
             # (로봇제어와 이 규칙 확인 필요) - grip_retry_attempts번 다 실패한 경우에만 여기 도달
+
             response.coordinate = [0.0, 0.0, 0.0]
             response.bbox_width = 0.0
             response.bbox_height = 0.0
             response.camera_depth_z = 0.0
+            response.is_find = False
             self.get_logger().warn(
                 f'[그립 확인] "{target_label}" {self.grip_retry_attempts}번 재시도했지만 '
                 f'끝내 못 찾음')
@@ -398,7 +401,7 @@ class ObjectDetectionNode(Node):
 
 
 def main():
-    model_path = '/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_best_roboflow.pt'  # 학습된 모델 경로로 수정
+    model_path = '/home/rokey/cobot_ws/src/simbongsa/desk_detect/my_aug_best.pt'  # 학습된 모델 경로로 수정
 
     if not Path(model_path).exists():
         print(f'File not found: {model_path}')
