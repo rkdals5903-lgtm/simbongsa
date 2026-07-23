@@ -6,7 +6,7 @@ import time
 
 import rclpy
 
-from hey_doopal_msg.action import FindOrder
+from hey_doopal_msg.action import FindTargetOrder
 
 
 class ConeScanner:
@@ -182,11 +182,11 @@ class ConeScanner:
             timeout_sec=5.0
         ):
             node.get_logger().error(
-                "/find_order 서버가 없습니다."
+                "/find_target_order 서버가 없습니다."
             )
             return None
 
-        goal = FindOrder.Goal()
+        goal = FindTargetOrder.Goal()
         goal.target_name = target_name
 
         future = self.action_client.send_goal_async(

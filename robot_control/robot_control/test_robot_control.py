@@ -6,7 +6,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from rclpy.action import ActionClient
 
-from hey_doopal_msg.action import FindOrder
+from hey_doopal_msg.action import FindTargetOrder
 from robot_control.cone_scan import ConeScanner
 from rclpy.executors import MultiThreadedExecutor
 
@@ -75,15 +75,15 @@ class TargetScanNode(Node):
 
         self.target_name = None
 
-        self.find_order_client = ActionClient(
+        self.find_target_order_client = ActionClient(
             self,
-            FindOrder,
-            "/find_order",
+            FindTargetOrder,
+            "/find_target_order",
         )
 
         self.cone_scanner = ConeScanner(
             node=self,
-            action_client=self.find_order_client,
+            action_client=self.find_target_order_client,
             scan_tilt_angle=SCAN_TILT_ANGLE,
             scan_point_count=SCAN_POINT_COUNT,
             scan_velocity=SCAN_VELOCITY,

@@ -11,7 +11,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ScanRequest.srv"
   "srv/GripBoundingBox.srv"
 
-  "action/FindOrder.action"
+  "action/FindTargetOrder.action"
 )
 
 # 런타임 의존성 내보내기

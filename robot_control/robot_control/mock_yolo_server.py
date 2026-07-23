@@ -7,7 +7,7 @@ from rclpy.action import (
 )
 from rclpy.node import Node
 
-from hey_doopal_msg.action import FindOrder
+from hey_doopal_msg.action import FindTargetOrder
 
 
 class MockYoloServer(Node):
@@ -17,8 +17,8 @@ class MockYoloServer(Node):
 
         self.action_server = ActionServer(
             self,
-            FindOrder,
-            "/find_order",
+            FindTargetOrder,
+            "/find_target_order",
             execute_callback=self.execute_callback,
             cancel_callback=self.cancel_callback,
         )
@@ -40,11 +40,11 @@ class MockYoloServer(Node):
             f"탐색 요청 수신: {target_name}"
         )
 
-        feedback = FindOrder.Feedback()
+        feedback = FindTargetOrder.Feedback()
 
         for index in range(10):
             if goal_handle.is_cancel_requested:
-                result = FindOrder.Result()
+                result = FindTargetOrder.Result()
                 result.found = False
                 result.coordinate = [0.0] * 6
                 result.message = "탐색 취소"
@@ -59,7 +59,7 @@ class MockYoloServer(Node):
 
             time.sleep(0.3)
 
-        result = FindOrder.Result()
+        result = FindTargetOrder.Result()
         result.found = True
         result.coordinate = [
             500.0,

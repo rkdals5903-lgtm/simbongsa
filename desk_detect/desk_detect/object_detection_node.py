@@ -13,7 +13,7 @@
          응답 필드에 found가 없어서, 전부 0이면 "없음"으로 간주하는 규칙 사용
          (로봇제어와 확인 필요).
 
-  - FindOrder 액션 ('find_order')
+  - FindTargetOrder 액션 ('find_target_order')
       -> grip_bounding_box에서 못 찾았을 때 호출. 특정 물체를 찾을 때까지
          계속 최신 프레임 확인, state로 진행상황 feedback,
          찾으면 result(found, coordinate, message) 반환.
@@ -48,7 +48,7 @@ from .rgbd_pixel_to_base import RgbdPixelToBase, bbox_center_xyxy
 
 # TODO 실제 인터페이스 패키지명 다시 한번 확인
 from hey_doopal_msg.srv import ScanRequest, GripBoundingBox
-from hey_doopal_msg.action import FindOrder
+from hey_doopal_msg.action import FindTargetOrder
 
 
 class ObjectDetectionNode(Node):
@@ -129,8 +129,8 @@ class ObjectDetectionNode(Node):
         action_cb_group = ReentrantCallbackGroup()
         self._action_server = ActionServer(
             self,
-            FindOrder,
-            'find_order',
+            FindTargetOrder,
+            'find_target_order',
             execute_callback=self.execute_callback,
             goal_callback=self.goal_callback,
             cancel_callback=self.cancel_callback,
@@ -138,7 +138,7 @@ class ObjectDetectionNode(Node):
         )
 
         self.get_logger().info(
-            'ObjectDetectionNode 준비 완료. yolo_scan_request(서비스), find_order(액션) 대기 중...')
+            'ObjectDetectionNode 준비 완료. yolo_scan_request(서비스), find_target_order(액션) 대기 중...')
 
     # ================= 카메라 수신 (공용) =================
     def camera_info_callback(self, msg: CameraInfo):
@@ -326,8 +326,8 @@ class ObjectDetectionNode(Node):
 
     def execute_callback(self, goal_handle):
         target_label = goal_handle.request.target_name
-        feedback_msg = FindOrder.Feedback()
-        result = FindOrder.Result()
+        feedback_msg = FindTargetOrder.Feedback()
+        result = FindTargetOrder.Result()
 
         start = time.time()
         attempts = 0
