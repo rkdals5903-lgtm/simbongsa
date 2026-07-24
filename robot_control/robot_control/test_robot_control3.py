@@ -1,6 +1,7 @@
 import sys
 import threading
 import time
+import json
 
 import rclpy
 from rclpy.node import Node
@@ -16,6 +17,8 @@ from hey_doopal_msg.action import FindOrder
 from hey_doopal_msg.srv import ScanRequest
 from hey_doopal_msg.srv import VoiceKeyword
 from hey_doopal_msg.srv import GripBoundingBox
+from hey_doopal_msg.srv import GetDbData
+
 from robot_control.cone_scan import ConeScanner
 from rclpy.executors import MultiThreadedExecutor
 
@@ -62,11 +65,12 @@ CONFIG = {
     "SCAN_WAYPOINT1":[434.7, 21.07, 552.72, 63.44, -179.21, 62.54],
     "SCAN_WAYPOINT2":[434.7, -187.14, 552.72, 63.44, -179.21, 62.54],
     "SCAN_WAYPOINT3":[431.95, -392.07, 419.67, 147.77, 180, -33.61],
-    "POS1": [744.33, -127.61, 228.65, 169.90,-142.46, 97.08],
-    "POS2": [342.82, 171.74, 395.16, 26.39, -176.26, -1.66],
+    "pos1": [744.33, -127.61, 228.65, 169.90,-142.46, 97.08],
+    "pos2": [342.82, 171.74, 395.16, 26.39, -176.26, -1.66],
     "HAND_SCAN": [445.29, -23.52, 533.56, 90, -90, -90],
     "drink": [420.59, -73.95, 256.60, 60.13, -179.84, -111.53],
     "airpods": [420.59, -73.95, 256.60, 60.13, -179.84, -111.53],
+    "mouse": [420.59, -73.95, 256.60, 60.13, -179.84, -111.53],
 }
 
 # 1. DSR 정보 등록
@@ -148,17 +152,12 @@ class TargetScanNode(Node):
         self.pub_re_scan_start = self.create_publisher(Bool, '/table_rescan_started', qos_profile)
         self.pub_re_scan_finish = self.create_publisher(Bool, '/table_rescan_finished', qos_profile)
         self.pub_say = self.create_publisher(String, '/say', qos_profile)
-        # self.pub_table_scan = self.create_publisher(Bool, '/table_scan_finished', 10)
-        # self.pub_hand_start = self.create_publisher(Bool, '/hand_scan_start', 10)
-        # self.pub_hand_finish = self.create_publisher(Bool, '/hand_scan_finished', 10)
-        # self.pub_task_done = self.create_publisher(Bool, '/task_completed', 10)
-        # self.pub_re_scan_start = self.create_publisher(Bool, '/table_rescan_started', 10) # 수정
-        # self.pub_re_scan_finish = self.create_publisher(Bool, '/table_rescan_finished', 10) # 수정
         
         #service_client
         self.scan_table_client= self.create_client(ScanRequest, "/yolo_scan_request")
         self.grip_bbox_client = self.create_client(GripBoundingBox, "/grip_bounding_box")
         self.approach_client = self.create_client(Trigger, "/arrived_goal")
+        self.db_client = self.create_client(GetDbData, "/assistive/get_db_data")
 
         #service_server
         self.get_keyword_service = self.create_service(VoiceKeyword, "/get_keyword", self.command_callback)
@@ -187,6 +186,25 @@ class TargetScanNode(Node):
 
         self.get_logger().info("target_scan_node 시작")
 
+    def get_objet_from_db(self, target_data):
+        request = GetDbData.Request()
+
+        if target_data == "hand":
+            request.data_type = "fixed_point"
+            request.name = "HAND_SCAN"
+
+        elif target_data == "table_scan":
+            request.data_type = "scan_case"
+            request.name = "CASE_1"
+
+        else:
+            request.data_type = "object"
+            request.name = target_data
+
+        future = self.db_client.call_async(request)
+        
+        return future
+    
     def ungrip_callback(self, request, response):
         
         self.gripper.move_gripper(width_val=1000, force_val=200)
@@ -462,8 +480,8 @@ class TargetScanNode(Node):
                 if not scan_success:
                     self.get_logger().error(f"{waypoint_id} YOLO 스캔 실패로 다음 Waypoint 이동을 중단합니다.")
                     return
-                
                 self.get_logger().info(f"{waypoint_id} 작업 완료")
+
             table_save_done = Bool()
             table_save_done.data = True
             self.pub_table_scan.publish(table_save_done)
