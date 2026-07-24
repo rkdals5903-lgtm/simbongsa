@@ -1,0 +1,15 @@
+# FindOrder.action
+
+# Goal
+string target_name
+---
+# Result
+bool found
+float64[3] coordinate       # 로봇 베이스 좌표계 기준 [x, y, z] -> "이건 로봇이 이동할 때 사용"
+float32 bbox_width          # 픽셀 너비
+float32 bbox_height         # 픽셀 높이
+float32 camera_depth_z      # 카메라 raw depth -> "이건 힘 계산할 때 사용"
+string message              # 객체 클래스 이름 등
+---
+# Feedback
+string state                # 현재 상태 (e.g., "searching", "calculating", "detected")

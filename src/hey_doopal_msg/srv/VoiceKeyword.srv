@@ -1,0 +1,5 @@
+string target
+string goal
+---
+bool success
+
