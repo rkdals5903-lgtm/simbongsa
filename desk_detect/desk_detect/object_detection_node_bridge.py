@@ -1,11 +1,11 @@
 """
 비전 노드 (책상 전체 스캔 + 특정 물체 찾기) 통합
-카메라 구독/좌표변환/DB 로직은 공용으로 한 번만 두고,
+카메라 구독/좌표변환/DB Bridge 전송 로직은 공용으로 한 번만 두고,
 그 위에 세 가지(서비스 2개 + 액션 1개)를 얹음:
 
   - ScanRequest 서비스 ('yolo_scan_request')
       -> 책상 전체 스캔. 로봇제어가 웨이포인트마다 도착할 때 1번씩 호출.
-         1프레임 인식 + DB upsert 후 바로 응답.
+         1프레임 인식 + Redis Bridge 토픽 발행 후 바로 응답.
 
   - GripBoundingBox 서비스 ('grip_bounding_box')
       -> DB에 저장된 좌표로 이미 이동한 상태에서, 그 자리에 물건이 실제로
@@ -26,7 +26,9 @@ import math
 import sys
 import time
 import threading
-import requests
+import json
+# [기존 HTTP DB 방식 비활성화]
+# import requests
 from pathlib import Path
 from ultralytics import YOLO
 
@@ -38,6 +40,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.duration import Duration
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo
+from std_msgs.msg import String
 import message_filters
 
 import tf2_ros
@@ -58,7 +61,8 @@ class ObjectDetectionNode(Node):
         color_topic='/camera/camera/color/image_raw',
         depth_topic='/camera/camera/aligned_depth_to_color/image_raw',
         camera_info_topic='/camera/camera/color/camera_info',
-        db_api_url='http://172.18.0.198:5000/api/objects/',  # DB API 엔드포인트로 수정
+        # [기존 HTTP DB 방식 비활성화]
+        # db_api_url='http://172.18.0.198:5000/api/objects/',
         hand_eye_transform_path='/home/rokey/cobot_ws/src/simbongsa/desk_detect/desk_detect/T_gripper2camera.npy',  # 실제 경로
         base_frame='base_link',          # 로봇제어 실제 이름 확인 필요
         calibration_frame='link_6',      # 실제 TF 이름 확인 필요
@@ -74,7 +78,8 @@ class ObjectDetectionNode(Node):
         self.model = model
         self.classNames = model.names
         self.bridge = CvBridge()
-        self.db_api_url = db_api_url
+        # [기존 HTTP DB 방식 비활성화]
+        # self.db_api_url = db_api_url
         self.full_scan_conf = full_scan_conf            # 전체 스캔용 
         self.find_target_conf = find_target_conf        # 타겟 스캔용 
         self.find_target_timeout = find_target_timeout
@@ -115,6 +120,14 @@ class ObjectDetectionNode(Node):
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [color_sub, depth_sub], queue_size=10, slop=0.05)
         self.sync.registerCallback(self.frame_callback)
+
+        # ---------- Redis Bridge 전송용 Publisher ----------
+        # UI ZIP의 ros_object_bridge.py가 이 토픽의 JSON을 받아 Redis에 저장함.
+        self.object_detection_pub = self.create_publisher(
+            String,
+            '/assistive/object_detection',
+            10,
+        )
 
         # ---------- 서비스 서버: 전체 스캔 ----------
         service_cb_group = ReentrantCallbackGroup()
@@ -218,23 +231,60 @@ class ObjectDetectionNode(Node):
 
         return detections
 
-    # ================= DB upsert (공용) =================
-    def upsert_to_db(self, detections):
-        """
-        DB(Django) 쪽에 upsert 전용 엔드포인트가 생겨서, 있으면 갱신/없으면 생성을
-        서버가 알아서 처리해줌. 이 노드는 그냥 POST 한 번만 보내면 됨
-        (예전처럼 GET으로 먼저 존재 확인 -> PATCH/POST 분기할 필요 없어짐).
-        """
-        for obj in detections:
-            try:
-                res = requests.post(self.db_api_url, json=obj, timeout=2.0)
+    # ================= 기존 HTTP DB upsert (비활성화) =================
+    # def upsert_to_db(self, detections):
+    #     """
+    #     기존 Django/Flask HTTP API 직접 저장 방식.
+    #     현재는 ros_object_bridge.py를 사용하므로 실행하지 않음.
+    #     """
+    #     for obj in detections:
+    #         try:
+    #             res = requests.post(self.db_api_url, json=obj, timeout=2.0)
+    #
+    #             if res.status_code not in (200, 201):
+    #                 self.get_logger().error(
+    #                     f'DB 저장 실패 ({res.status_code}): {obj["class_name"]}')
+    #
+    #         except requests.exceptions.RequestException as e:
+    #             self.get_logger().error(f'DB 요청 실패: {e}')
 
-                if res.status_code not in (200, 201):
-                    self.get_logger().error(
-                        f'DB 저장 실패 ({res.status_code}): {obj["class_name"]}')
+    # ================= Redis Bridge 전송 (공용) =================
+    def publish_to_db_bridge(self, detections):
+        """
+        UI ZIP의 ros_object_bridge.py가 구독하는
+        /assistive/object_detection 토픽으로 객체 정보를 전송한다.
 
-            except requests.exceptions.RequestException as e:
-                self.get_logger().error(f'DB 요청 실패: {e}')
+        메시지 형식:
+          {
+            "record_name": "객체명",
+            "data": {객체별 자유 JSON 데이터},
+            "replace": false
+          }
+        """
+        for detection in detections:
+            class_name = detection.get('class_name')
+
+            if not class_name:
+                self.get_logger().error(
+                    '[DB Bridge] class_name이 없어 전송하지 않습니다.')
+                continue
+
+            payload = {
+                'record_name': class_name,
+                'data': detection,
+                # False이면 기존 객체 레코드에 새 필드를 병합함.
+                'replace': False,
+            }
+
+            message = String()
+            message.data = json.dumps(
+                payload,
+                ensure_ascii=False,
+            )
+            self.object_detection_pub.publish(message)
+
+            self.get_logger().info(
+                f'[DB Bridge] 객체 정보 발행: {class_name}')
 
     # ================= 서비스: 전체 스캔 =================
     def handle_scan_request(self, request, response):
@@ -243,9 +293,12 @@ class ObjectDetectionNode(Node):
         detections = self.run_inference_on_latest_frame(self.full_scan_conf)
 
         if detections:
-            self.upsert_to_db(detections)
+            # [기존 HTTP DB 방식 비활성화]
+            # self.upsert_to_db(detections)
+            self.publish_to_db_bridge(detections)
             response.success = True
-            response.message = f'{len(detections)}개 객체 스캔 및 DB 저장 완료'
+            # response.message = f'{len(detections)}개 객체 스캔 및 DB 저장 완료'
+            response.message = f'{len(detections)}개 객체 스캔 및 DB Bridge 전송 완료'
             response.detected_count = len(detections)
         else:
             response.success = True
@@ -278,7 +331,9 @@ class ObjectDetectionNode(Node):
                 time.sleep(self.grip_retry_interval)
 
         if best is not None:
-            self.upsert_to_db([best])  # 재확인 시점 최신 위치로 DB도 갱신
+            # [기존 HTTP DB 방식 비활성화]
+            # self.upsert_to_db([best])
+            self.publish_to_db_bridge([best])  # 재확인 시점 최신 위치를 Bridge로 전달
 
             response.coordinate = [best['x'] * 1000, best['y'] * 1000, best['z'] * 1000]
             response.bbox_width = float(best['bbox_width'])
@@ -304,7 +359,7 @@ class ObjectDetectionNode(Node):
 
         # if detections:
         #     best = max(detections, key=lambda d: d['confidence'])
-        #     self.upsert_to_db([best])  # 재확인 시점 최신 위치로 DB도 갱신
+        #     self.upsert_to_db([best])  # [기존 HTTP DB 방식, 계속 비활성화]
 
         #     response.coordinate = [best['x'], best['y'], best['z']]
         #     response.bbox_width = float(best['bbox_width'])
@@ -374,7 +429,9 @@ class ObjectDetectionNode(Node):
             goal_handle.publish_feedback(feedback_msg)
 
             # run_inference_on_latest_frame에서 이미 base 좌표까지 다 계산해서 넣어둠
-            self.upsert_to_db([found_detection])
+            # [기존 HTTP DB 방식 비활성화]
+            # self.upsert_to_db([found_detection])
+            self.publish_to_db_bridge([found_detection])
             goal_handle.succeed()
 
             result.found = True
