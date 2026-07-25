@@ -27,12 +27,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'robot_control = robot_control.robot_control:main',
-            'test_robot_control = robot_control.test_robot_control:main',
-            'test1_robot_control = robot_control.test_robot_control1:main',
+            'final_robot_control = robot_control.final_robot_control:main',
             'test2_robot_control = robot_control.test_robot_control2:main',
-            'mock_yolo = robot_control.mock_yolo_server:main',
-            'mock_voice = robot_control.mock_voice:main',
         ],
     },
 )
