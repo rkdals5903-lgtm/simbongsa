@@ -18,7 +18,6 @@ from hey_doopal_msg.srv import VoiceKeyword
 from hey_doopal_msg.srv import GripBoundingBox
 from hey_doopal_msg.srv import GetFixedPose
 from hey_doopal_msg.srv import GetScanCase
-from hey_doopal_msg.srv import GetObjectCoordinate
 
 from robot_control.cone_scan import ConeScanner
 from rclpy.executors import MultiThreadedExecutor
@@ -58,27 +57,6 @@ YOLO_SERVICE_WAIT_TIMEOUT = 5.0
 # YOLO 한 번의 스캔 응답을 기다리는 시간
 YOLO_SCAN_RESPONSE_TIMEOUT = 30.0
 
-# =========================
-# Position Configuration
-# =========================
-# # 나중에 데이터베이스 또는 통신으로 바뀔 부분 ctrl+f "CONFIG"
-# CONFIG = {
-#     # table scan waypoint 좌표
-#     "SCAN_WAYPOINT1":[434.7, 21.07, 552.72, 63.44, -179.21, 62.54],
-#     "SCAN_WAYPOINT2":[434.7, -187.14, 552.72, 63.44, -179.21, 62.54],
-#     "SCAN_WAYPOINT3":[431.95, -392.07, 419.67, 147.77, 180, -33.61],
-
-#     "pos1": [744.33, -127.61, 228.65, 169.90,-142.46, 97.08],
-#     "pos2": [434.7, 21.07, -12.64, 172.84, 180, -7.97],
-#     # hand scan waypoint 좌표
-#     "HAND_SCAN": [445.29, -23.52, 533.56, 90, -90, -90], 
-
-#     #target 좌표
-#     "drink": [481.67, -109.53, -12.64, 172.84, 180, -7.97],
-#     "airpods": [481.67, -109.53, -12.64, 172.84, 180, -7.97],
-#     "mouse": [481.67, -109.53, -12.64, 172.84, 180, -7.97],
-# }
-
 # 1. DSR 정보 등록
 DR_init.__dsr__id = ROBOT_ID
 DR_init.__dsr__model = ROBOT_MODEL
@@ -93,6 +71,7 @@ DR_init.__dsr__node = dsr_node
 try:
     from DSR_ROBOT2 import (
         movel,
+        movej,
         get_current_posx,
         task_compliance_ctrl,
         set_desired_force,
@@ -154,9 +133,10 @@ class TargetScanNode(Node):
         self.pub_hand_start = self.create_publisher(Bool, '/hand_scan_start', qos_profile)
         self.pub_hand_finish = self.create_publisher(Bool, '/hand_scan_finished', qos_profile)
         self.pub_task_completed = self.create_publisher(Bool, '/task_completed', qos_profile)
-        self.pub_re_scan_start = self.create_publisher(Bool, '/table_rescan_started', qos_profile)
-        self.pub_re_scan_finish = self.create_publisher(Bool, '/table_rescan_finished', qos_profile)
+        self.pub_table_rescan_start = self.create_publisher(Bool, '/table_rescan_started', qos_profile)
+        self.pub_table_rescan_finish = self.create_publisher(Bool, '/table_rescan_finished', qos_profile)
         self.pub_say = self.create_publisher(String, '/say', qos_profile)
+        self.pub_error_status = self.create_publisher(String, '/robot_error_status', qos_profile)
         
         # service_client
         self.scan_table_client= self.create_client(ScanRequest, "/yolo_scan_request")
@@ -166,7 +146,6 @@ class TargetScanNode(Node):
         # service_client(DB)
         self.db_fixed_pose_client = self.create_client(GetFixedPose, "/get_fixed_pose")
         self.db_scan_case_client = self.create_client(GetScanCase, "/get_scan_case")
-        self.db_client = self.create_client(GetObjectCoordinate, "/get_object_coordinate")
 
         # service_server
         self.get_keyword_service = self.create_service(VoiceKeyword, "/get_keyword", self.command_callback)
@@ -205,10 +184,11 @@ class TargetScanNode(Node):
 
         if goal_name == "table_scan":
             threading.Thread(
-                target=self.run_save_scan,
+                target=self.run_table_scan,
                 args=(goal_name,),
                 daemon=True,
             ).start()
+            response.accepted = True
             return response
 
         threading.Thread(
@@ -216,7 +196,6 @@ class TargetScanNode(Node):
             args=(target_names, goal_name),
             daemon=True,
         ).start()
-
         response.accepted = True
         return response
 
@@ -227,7 +206,13 @@ class TargetScanNode(Node):
         if not goal_name :
             goal_name = "hand"
 
-        response = self.get_objet_from_db(goal_name)
+        response = self.get_object_from_db(goal_name)
+        if response is None:
+            self.get_logger().error(f"{goal_name} DB 좌표 수신 실패")
+            error = String()
+            error.data = "DB 좌표 수신 실패"
+            self.pub_error_status.publish(error) 
+            return
         goal_coordinate = list(response.pose)
                 
         if goal_name == "hand":
@@ -235,17 +220,28 @@ class TargetScanNode(Node):
             hand_scan.data = True
             self.pub_hand_start.publish(hand_scan) 
             center_pose = list(goal_coordinate)
-            self.run_cone_scan(center_pose, goal_name)
-
+            scan_success = self.run_cone_scan(center_pose, goal_name)
+            if not scan_success:
+                self.get_logger().error(f"{goal_name} 좌표 탐색 실패")
+                error = String()
+                error.data = "좌표 탐색 실패"
+                self.pub_error_status.publish(error)
+                return
             goal_coordinate[:3]= self.detected_coordinate[:3]
             self.pub_hand_finish.publish(hand_scan)
         
-        self.get_logger().info(f"목표좌표 설정 완료:{goal_coordinate}]")
+        self.get_logger().info(f"목표좌표 설정 완료:{goal_coordinate}")
         
         # target 좌표를 DB에서 가져와서 이동
         for target_name in target_names:
 
-            response = self.get_objet_from_db(target_name)
+            response = self.get_object_from_db(target_name)
+            if response is None:
+                self.get_logger().error(f"{target_name} DB 좌표 수신 실패")
+                error = String()
+                error.data = "DB 좌표 수신 실패"
+                self.pub_error_status.publish(error)
+                continue
             target_coordinate = list(response.pose)
 
             self.get_logger().info(f"DB 타깃좌표 설정 완료:{target_coordinate}")
@@ -254,22 +250,25 @@ class TargetScanNode(Node):
             target_above = list(target_coordinate)
             target_above[2] += 100.0
             
-            self.move_to_position(move_name, target_above)
+            move_success = self.move_to_position(move_name, target_above)
+
+            if not move_success:
+                self.get_logger().error(f"{move_name} 이동 실패")
+                error = String()
+                error.data = "이동 실패"
+                self.pub_error_status.publish(error)
+                continue
 
             self.gripper.move_gripper(width_val=1000, force_val=200)
 
             grip_request = GripBoundingBox.Request()
             grip_request.target = target_name
 
-            grip_future = self.grip_bbox_client.call_async(grip_request)
+            grip_response = self.call_service(self.grip_bbox_client, grip_request, timeout=30.0)
 
-            grip_event = threading.Event()
-
-            grip_future.add_done_callback(lambda _future: grip_event.set())
-
-            grip_event.wait()
-
-            grip_response = grip_future.result()
+            if grip_response is None:
+                self.get_logger().error("YOLO 파지 정보 수신 실패")
+                continue
 
             self.get_logger().info(
                 f"YOLO 파지 정보 수신: "
@@ -289,9 +288,14 @@ class TargetScanNode(Node):
                 target_scan = Bool()
                 target_scan.data = True
                 self.pub_table_rescan_start.publish(target_scan) 
+                scan_success = self.run_cone_scan(center_pose, target)
 
-                self.run_cone_scan(center_pose, target)
-
+                if not scan_success:
+                    self.get_logger().error(f"{target_name} 좌표 탐색 실패")
+                    target_scan.data = False
+                    self.pub_table_rescan_finish.publish(target_scan) 
+                    continue
+                
                 self.pub_table_rescan_finish.publish(target_scan) 
                 
                 target_coordinate = list(center_pose)
@@ -302,55 +306,89 @@ class TargetScanNode(Node):
             self.get_logger().info(f"타깃좌표 설정 완료:{grip_coordinate}")
 
             move_name = f"{target_name}_grip"
-            self.move_to_position(move_name, grip_coordinate)
+            move_success = self.move_to_position(move_name, grip_coordinate)
 
-        # =========================
-        # 물체 파지
-        # =========================
-        self.run_adaptive_grip(
-            bbox_w=grip_response.bbox_width,
-            bbox_h=grip_response.bbox_height,
-            dist=grip_response.camera_depth_z,
-        )
+            if not move_success:
+                self.get_logger().error(f"{move_name} 이동 실패")
+                continue
 
-        # 물체를 잡은 후 위로 이동
-        grip_above = list(grip_coordinate)
-        grip_above[2] += 100.0
+            # =========================
+            # 물체 파지
+            # =========================
+            grip_success = self.run_adaptive_grip(
+                bbox_w=grip_response.bbox_width,
+                bbox_h=grip_response.bbox_height,
+                dist=grip_response.camera_depth_z,
+            )
+            if not grip_success:
+                self.get_logger().error("Adaptive Grip 실패")
+                error = String()
+                error.data = "Adaptive Grip 실패"
+                self.pub_error_status.publish(error)
+                continue
+            # 물체를 잡은 후 위로 이동
+            grip_above = list(grip_coordinate)
+            grip_above[2] += 100.0
 
-        move_name = f"{target_name}_above_after_grip"
-        self.move_to_position(move_name, grip_above)
+            move_name = f"{target_name}_above_after_grip"
+            move_success = self.move_to_position(move_name, grip_above)
 
-        # =========================
-        # goal로 이동
-        # =========================
-        # 손에 전달할 때
-        if goal_name == "hand":
-            move_name = f"{goal_name}"
-            move_done = self.move_to_position(move_name, goal_coordinate)
-    
-            if move_done:
-                self.get_logger().error(f"{goal_name} 이동 실패")
+            if not move_success:
+                self.get_logger().error(f"{move_name} 이동 실패")
+                error = String()
+                error.data = f"{move_name} 이동 실패"
+                self.pub_error_status.publish(error)
                 return
+
+            # =========================
+            # goal로 이동
+            # =========================
+            # 손에 전달할 때
+            if goal_name == "hand":
+                move_name = f"{goal_name}"
+                move_success = self.move_to_position(move_name, goal_coordinate)
+        
+                if not move_success:
+                    self.get_logger().error(f"{goal_name} 이동 실패")
+                    error = String()
+                    error.data = f"{goal_name} 이동 실패"
+                    self.pub_error_status.publish(error)
+                    return
+                else:
+                    self.get_logger().info(f"{goal_name} 이동 완료")
+                    request = Trigger.Request()
+                    approach_response = self.call_service(self.approach_client, request, timeout=5.0)
+
+                    if approach_response is None:
+                        self.get_logger().error("arrived_goal 서비스 호출 실패")
+                        error = String()
+                        error.data = "arrived_goal 서비스 호출 실패"
+                        self.pub_error_status.publish(error)
+                        return
+
+            # 손이 아닌 경우 "pos1, pos2, pos3"
             else:
-                self.get_logger().info(f"{goal_name} 이동 완료")
-                request = Trigger.Request()
-                self.approach_client.call(request)
-                return
-        # 손이 아닌 경우 "pos1, pos2, pos3"
-        else:
-            move_name = f"{goal_name}_approach"
-            goal_above = list(goal_coordinate)
-            goal_above[2] += 10.0
+                move_name = f"{goal_name}_approach"
+                goal_above = list(goal_coordinate)
+                goal_above[2] += 10.0
 
-            move_done = self.move_to_position(move_name, goal_above)
+                move_success = self.move_to_position(move_name, goal_above)
+                if not move_success:
+                    self.get_logger().error(f"{goal_name} 이동 실패")
+                    error = String()
+                    error.data = f"{goal_name} 이동 실패"
+                    self.pub_error_status.publish(error)
+                    return
+                place_success = self.place_with_compliance()
 
-            place_success = self.place_with_compliance()
+                if not place_success:
+                    self.get_logger().error("내려놓기 실패")
+                    error = String()
+                    error.data = "내려놓기 실패"
+                    self.pub_error_status.publish(error)
+                    return
 
-            if not place_success:
-                self.get_logger().error("내려놓기 실패")
-                return
-
-        self.get_logger().info("로봇 작업 완료")
+            self.get_logger().info("로봇 작업 완료")
 
     # 내려놓기 위한 순응 제어
     def place_with_compliance(self, press_force=20.0, force_threshold=8.0, timeout=5.0):
@@ -430,6 +468,9 @@ class TargetScanNode(Node):
         # 접촉 못 했으면 절대 열지 않기
         if not contacted:
             self.get_logger().warning("바닥 접촉이 없어서 그리퍼를 열지 않습니다.")
+            error = String()
+            error.data = "바닥 접촉이 없어서 그리퍼를 열지 않습니다."
+            self.pub_error_status.publish(error)
             return False
 
         self.gripper.move_gripper(width_val=1000,force_val=200)
@@ -441,22 +482,29 @@ class TargetScanNode(Node):
         return True
 
     # 원뿔 스캔 실행
-    def run_cone_scan(self, center_pose, target_name):
-        if target_name == "hand":
-            coordinate = self.hand_scanner.scan(center_pose, target_name)
-        else:
-            coordinate = self.target_scanner.scan(center_pose, target_name)
+    def run_cone_scan(self, center_pose, target_name, max_retries=3):
+        for attempt in range(max_retries):
+            if target_name == "hand":
+                coordinate = self.hand_scanner.scan(center_pose, target_name)
+            else:
+                coordinate = self.target_scanner.scan(center_pose, target_name)
 
-        if coordinate is None:
-            self.get_logger().warning(f"{target_name} 좌표 탐색 실패")
-            return
-        
-        self.detected_coordinate = coordinate
-        self.get_logger().info(f"{target_name} 최종 좌표: {coordinate}")
+            if coordinate is not None:
+                self.detected_coordinate = coordinate
+                self.get_logger().info(f"{target_name} 최종 좌표: {coordinate}")
+                return True
+            
+            self.get_logger().warning(f"{target_name} 좌표 탐색 실패 (시도 {attempt + 1}/{max_retries})")
+            
+        self.get_logger().info(f"{target_name} 좌표 탐색 최종 실패")
+        error = String()
+        error.data = f"{target_name} 좌표 탐색 최종 실패"
+        self.pub_error_status.publish(error)
+        return False
 
     # ##############################################################################
     # table_scan 
-    def run_save_scan(self, goal_name):
+    def run_table_scan(self, goal_name):
         """
         로봇을 두 개의 Waypoint로 순차 이동시킨다.
 
@@ -464,7 +512,11 @@ class TargetScanNode(Node):
         ScanRequest 서비스를 요청하고 응답을 기다린다.
         """
         self.get_logger().info("DB_SCAN_CASE 서비스 호출 시작")
-        response = self.get_objet_from_db(goal_name)
+        response = self.get_object_from_db(goal_name)
+
+        if response is None:
+            self.get_logger().error(f"{goal_name} DB 좌표 수신 실패")
+            return
 
         waypoints = []
 
@@ -487,25 +539,33 @@ class TargetScanNode(Node):
         self.get_logger().info("테이블 스캔 작업을 시작합니다.")
 
         try:
-            for waypoint_id in waypoints:
-                if not rclpy.ok():
-                    self.get_logger().warning( "ROS가 종료되어 테이블 스캔을 중단합니다.")
-                    return
-                
+            for i, waypoint in enumerate(waypoints, start=1):
+
+                move_waypoint = list(waypoint)
+                move_waypoint[2] -= 250.0
+                field_name = f"pose_name_{i}"
+                waypoint_name = getattr(response, field_name, f"Waypoint_{i}")
+
                 # 1. 로봇 이동
-                move_success = self.move_to_position(waypoint_id)
+                move_success = self.move_to_position(waypoint_name, move_waypoint)
 
                 if not move_success:
-                    self.get_logger().error( f"{waypoint_id} 이동 실패로 테이블 스캔을 중단합니다.")
+                    error = String()
+                    error.data = f"{waypoint_name} 이동 실패"
+                    self.pub_error_status.publish(error)
+                    self.get_logger().error( f"{waypoint_name} 이동 실패로 테이블 스캔을 중단합니다.")
                     return
 
                 # 2. YOLO 스캔 요청
-                scan_success = self.request_yolo_scan(waypoint_id)
+                scan_success = self.request_yolo_scan(waypoint_name)
 
                 if not scan_success:
-                    self.get_logger().error(f"{waypoint_id} YOLO 스캔 실패로 다음 Waypoint 이동을 중단합니다.")
+                    error = String()
+                    error.data = f"{waypoint_name} YOLO 스캔 실패"
+                    self.pub_error_status.publish(error)
+                    self.get_logger().error(f"{waypoint_name} YOLO 스캔 실패로 다음 Waypoint 이동을 중단합니다.")
                     return
-                self.get_logger().info(f"{waypoint_id} 작업 완료")
+                self.get_logger().info(f"{waypoint_name} 작업 완료")
 
             table_save_done = Bool()
             table_save_done.data = True
@@ -516,7 +576,7 @@ class TargetScanNode(Node):
             self.get_logger().error(f"테이블 스캔 중 예외 발생: {error}")
 
     # table_scan 시 waypoint마다 yolo에게 스캔 요청 및 응답을 기다리는 함수
-    def request_yolo_scan(self, waypoint_id):
+    def request_yolo_scan(self, waypoint_name):
         """
         YOLO 노드의 /yolo_scan_request 서비스를 호출한다.
 
@@ -525,7 +585,7 @@ class TargetScanNode(Node):
             False:  서비스 없음, 응답 시간 초과, 통신 예외 또는 response.success == False
         """
 
-        self.get_logger().info(f"YOLO 서비스 확인 중: {waypoint_id}")
+        self.get_logger().info(f"YOLO 서비스 확인 중: {waypoint_name}")
         # 서비스 서버가 살아있는지 확인 => True/ False
         service_ready = self.scan_table_client.wait_for_service(timeout_sec=YOLO_SERVICE_WAIT_TIMEOUT)
         if not service_ready:
@@ -533,49 +593,19 @@ class TargetScanNode(Node):
             return False
 
         request = ScanRequest.Request()
-        request.waypoint_id = waypoint_id
-
-        self.get_logger().info(f"YOLO 스캔 요청 전송: waypoint_id={waypoint_id}")
-
-        try:
-            future = self.scan_table_client.call_async(request)
-
-        except Exception as error:
-            self.get_logger().error(f"YOLO 서비스 요청 전송 실패: {error}")
-            return False
-
-        # 이 함수는 별도 작업 스레드에서 실행된다.
-        # MultiThreadedExecutor는 ROS 서비스 응답을 처리하고,
-        # 완료되면 Event를 활성화한다.
-        response_event = threading.Event()
-
-        def response_done_callback(_future):
-            response_event.set()
-
-        future.add_done_callback(response_done_callback)
-
-        response_received = response_event.wait(timeout=YOLO_SCAN_RESPONSE_TIMEOUT)
-
-        if not response_received:
-            self.get_logger().error(f"YOLO 스캔 응답 시간 초과: {waypoint_id}, {YOLO_SCAN_RESPONSE_TIMEOUT}초")
-            return False
-
-        try:
-            response = future.result()
-
-        except Exception as error:
-            self.get_logger().error(f"YOLO 서비스 응답 처리 실패: {error}")
-            return False
+        request.waypoint_id = waypoint_name
+        self.get_logger().info(f"YOLO 스캔 요청 전송: waypoint_id={waypoint_name}")
+        response = self.call_service( self.scan_table_client, request, timeout=YOLO_SCAN_RESPONSE_TIMEOUT)
 
         if response is None:
-            self.get_logger().error(f"YOLO 서비스 응답이 없습니다: {waypoint_id}")
+            self.get_logger().error(f"YOLO 서비스 응답 수신 실패: {waypoint_name}")
             return False
-
+        
         # YOLO가 전달한 정보는 현재 제어 판단에는 사용하지 않고
         # 로그만 출력한다.
         self.get_logger().info(
             f"YOLO 응답 수신: "
-            f"waypoint_id={waypoint_id}, "
+            f"waypoint_id={waypoint_name}, "
             f"success={response.success}, "
             f"detected_count={response.detected_count}, "
             f"message='{response.message}'"
@@ -602,15 +632,17 @@ class TargetScanNode(Node):
         time.sleep(2.0)
         if self.gripper.get_status()[0] == 1:
             self.get_logger().info(">> 파지 성공!")
-        else:
-            self.get_logger().warn(">> 파지 실패")
+            return True
+        
+        self.get_logger().warn(">> 파지 실패")
+        return False
 
     # 그립퍼 열기 서비스 콜백
     def ungrip_callback(self, request, response):            
         self.gripper.move_gripper(width_val=1000, force_val=200)
         msg = Bool()
         msg.data = True
-        self.pub_task_done.publish(msg)  # 최종 작업 완료
+        self.pub_task_completed.publish(msg)  # 최종 작업 완료
         response.success = True
         return response
     
@@ -620,16 +652,15 @@ class TargetScanNode(Node):
         self.get_logger().info(f"{move_name} ({target_position}) 이동 시작")
         try:
             movel(target_position, vel=VELOCITY, acc=ACCELERATION)
-
-        except Exception as error:
-            self.get_logger().error(f"{move_name} ({target_position}) 이동 중 오류 발생: {error}")
+        except Exception as exc:
+            self.report_error(f"{move_name} ({target_position}) 이동 중 오류 발생: {exc}, {move_name} 이동 실패")
             return False
 
         self.get_logger().info(f"{move_name} 이동 완료")
         return True
 
     # DB에서 좌표 가져오는 함수
-    def get_objet_from_db(self, target_data):
+    def get_object_from_db(self, target_data):
         """
         req_type에 따라 호출할 서비스를 결정합니다.
         - "fixed_pose": pos1, pos2, HAND_SCAN 등 6자유도 포즈 (GetFixedPose)
@@ -640,9 +671,8 @@ class TargetScanNode(Node):
         if target_data == "table_scan":
             request = GetScanCase.Request()
             request.case_name = "CASE_1"
-            future = self.db_scan_case_client.call_async(request)
-            response = future.result()
-            return response
+            return self.call_service(self.db_scan_case_client, request)
+
 
         elif target_data in ("hand", "pos1", "pos2", "pos3"):
             request = GetFixedPose.Request()
@@ -650,16 +680,65 @@ class TargetScanNode(Node):
                 request.pose_name = "HAND_SCAN"
             else:
                 request.pose_name = target_data
-            future = self.db_fixed_pose_client.call_async(request)
-            response = future.result()
-            return response
-
+            return self.call_service(self.db_fixed_pose_client, request)
+           
         else: # 기본값은 object
             request = GetFixedPose.Request()
             request.pose_name = target_data
-            future = self.db_client.call_async(request)
-            response = future.result()
-            return response
+            return self.call_service(self.db_fixed_pose_client, request)
+           
+    def call_service(self, client, request, timeout=10.0):
+        future = client.call_async(request)
+
+        response_event = threading.Event()
+        future.add_done_callback(lambda _: response_event.set())
+
+        received = response_event.wait(timeout=timeout)
+
+        if not received:
+            self.report_error("서비스 응답 시간 초과")
+            return None
+
+        try:
+            return future.result()
+
+        except Exception as exc:
+            self.report_error(f"서비스 호출 실패: {exc}")
+            return None
+        # if not received:
+        #     self.get_logger().error("서비스 응답 시간 초과")
+        #     error = String()
+        #     error.data = "서비스 응답 시간 초과"
+        #     self.pub_error_status.publish(error)
+        #     return None
+
+        # try:
+        #     return future.result()
+
+        # except Exception as error:
+        #     log_message = f"서비스 호출 실패: {error}"
+        #     self.report_error(log_message)
+        #     self.return_to_home()
+            # self.get_logger().error(f"서비스 호출 실패: {error}")
+            # error = String()
+            # error.data = f"서비스 호출 실패: {error}"
+            # self.pub_error_status.publish(error)
+            # return None
+
+    def report_error(self, log_message, status_message=None):
+
+        self.get_logger().error(log_message)
+        msg = String()
+        msg.data = (status_message if status_message is not None else log_message)
+        self.pub_error_status.publish(msg)
+
+    def return_to_home(self):
+        try:
+            movej([0, 0, 90, 0, 90, 0], vel=VELOCITY, acc=ACCELERATION)
+            self.get_logger().info("대기모드 복귀 완료")
+
+        except Exception as exc:
+            self.report_error(f"대기모드 복귀 실패: {exc}")
 
 def main(args=None):
     node = TargetScanNode()
@@ -676,7 +755,7 @@ def main(args=None):
 
     finally:
         executor.shutdown()
-
+        node.gripper.close_connection()
         node.destroy_node()
         dsr_node.destroy_node()
 
