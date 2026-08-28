@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets
+.env
+
+# Logs / runtime data
+logs/
+*.log
+runtime_logs.jsonl
+runtime_logs.jsonl.*
